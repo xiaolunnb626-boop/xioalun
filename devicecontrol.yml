@@ -1,0 +1,1092 @@
+name: Build DeviceControl APK
+
+# 本文件是唯一需要上传到仓库的文件：它会在云端自己生成整个项目（不需要你再上传 build.gradle、
+# app 文件夹等任何其他文件），然后编译出 APK。只要这一个文件在正确的路径上，就能跑起来。
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate project files
+        run: |
+          mkdir -p app/src/main/java/com/DL/devcontrol
+          mkdir -p app/src/main/res/values
+          mkdir -p gradle/wrapper
+          cat > settings.gradle <<'DCEOF'
+          include ':app'
+          DCEOF
+
+          cat > build.gradle <<'DCEOF'
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.1.4'
+              }
+          }
+
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          DCEOF
+
+          cat > gradle.properties <<'DCEOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          DCEOF
+
+          cat > gradle/wrapper/gradle-wrapper.properties <<'DCEOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.2-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          DCEOF
+
+          cat > app/build.gradle <<'DCEOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.DL.devcontrol'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.DL.devcontrol"
+                  minSdk 24
+                  targetSdk 33
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          DCEOF
+
+          cat > app/src/main/AndroidManifest.xml <<'DCEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <!-- 局域网管控服务：主机模式接受连接并展示设备信息；用户端模式连接主机并上报本机信息 -->
+                  <service
+                      android:name=".ControlService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="lan_device_monitor" />
+                  </service>
+              </application>
+          </manifest>
+          DCEOF
+
+          cat > app/src/main/res/values/strings.xml <<'DCEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">设备管控</string>
+          </resources>
+          DCEOF
+
+          cat > app/src/main/java/com/DL/devcontrol/DeviceInfo.java <<'DCEOF'
+          package com.DL.devcontrol;
+
+          import android.app.ActivityManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.content.SharedPreferences;
+          import android.os.BatteryManager;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.os.StatFs;
+
+          import org.json.JSONException;
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.FileReader;
+          import java.util.UUID;
+
+          /** 收集本机设备信息：型号、系统版本、处理器、电量等。只读，不上传到任何外部服务器。 */
+          final class DeviceInfo {
+
+              private DeviceInfo() { }
+
+              /** 本机的稳定标识，首次调用时生成并持久化 */
+              static String deviceId(Context ctx) {
+                  SharedPreferences sp = ctx.getSharedPreferences("devctl", Context.MODE_PRIVATE);
+                  String id = sp.getString("device_id", null);
+                  if (id == null) {
+                      id = UUID.randomUUID().toString();
+                      sp.edit().putString("device_id", id).apply();
+                  }
+                  return id;
+              }
+
+              static JSONObject collect(Context ctx) {
+                  JSONObject o = new JSONObject();
+                  put(o, "model", Build.MODEL);
+                  put(o, "manufacturer", Build.MANUFACTURER);
+                  put(o, "release", Build.VERSION.RELEASE);
+                  put(o, "sdk", Build.VERSION.SDK_INT);
+                  put(o, "abi", primaryAbi());
+                  put(o, "cores", Runtime.getRuntime().availableProcessors());
+                  String hw = cpuHardware();
+                  if (hw != null) put(o, "cpuHardware", hw);
+
+                  try {
+                      Intent bi = ctx.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+                      if (bi != null) {
+                          int level = bi.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+                          int scale = bi.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+                          if (level >= 0 && scale > 0) put(o, "battery", Math.round(level * 100f / scale));
+                          int status = bi.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+                          boolean charging = status == BatteryManager.BATTERY_STATUS_CHARGING
+                                  || status == BatteryManager.BATTERY_STATUS_FULL;
+                          put(o, "charging", charging);
+                      }
+                  } catch (Throwable ignored) { }
+
+                  try {
+                      ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+                      ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+                      am.getMemoryInfo(mi);
+                      put(o, "ramTotalGB", mi.totalMem / 1073741824.0);
+                      put(o, "ramAvailGB", mi.availMem / 1073741824.0);
+                  } catch (Throwable ignored) { }
+
+                  try {
+                      StatFs sf = new StatFs(Environment.getExternalStorageDirectory().getPath());
+                      double freeGB = (sf.getAvailableBlocksLong() * sf.getBlockSizeLong()) / 1073741824.0;
+                      put(o, "storageFreeGB", freeGB);
+                  } catch (Throwable ignored) { }
+
+                  try {
+                      put(o, "appVer", ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName);
+                  } catch (Throwable ignored) { }
+
+                  return o;
+              }
+
+              private static String primaryAbi() {
+                  try {
+                      String[] abis = Build.SUPPORTED_ABIS;
+                      if (abis != null && abis.length > 0) return abis[0];
+                  } catch (Throwable ignored) { }
+                  try {
+                      //noinspection deprecation
+                      return Build.CPU_ABI;
+                  } catch (Throwable ignored) {
+                      return null;
+                  }
+              }
+
+              /** 读取 /proc/cpuinfo 的 Hardware / model name 字段；不少新系统会限制读取，读不到就返回 null */
+              private static String cpuHardware() {
+                  BufferedReader br = null;
+                  try {
+                      br = new BufferedReader(new FileReader("/proc/cpuinfo"));
+                      String line;
+                      while ((line = br.readLine()) != null) {
+                          if (line.startsWith("Hardware") || line.startsWith("model name")) {
+                              int idx = line.indexOf(':');
+                              if (idx >= 0) return line.substring(idx + 1).trim();
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                  } finally {
+                      if (br != null) {
+                          try {
+                              br.close();
+                          } catch (Throwable ignored) { }
+                      }
+                  }
+                  return null;
+              }
+
+              private static void put(JSONObject o, String k, Object v) {
+                  try {
+                      o.put(k, v);
+                  } catch (JSONException ignored) { }
+              }
+          }
+          DCEOF
+
+          cat > app/src/main/java/com/DL/devcontrol/LanUtil.java <<'DCEOF'
+          package com.DL.devcontrol;
+
+          import android.content.Context;
+          import android.net.wifi.WifiInfo;
+          import android.net.wifi.WifiManager;
+
+          final class LanUtil {
+
+              private LanUtil() { }
+
+              /** 本机在当前 Wi-Fi 下的局域网 IP，取不到时返回提示文字 */
+              static String localIp(Context ctx) {
+                  try {
+                      WifiManager wm = (WifiManager) ctx.getApplicationContext()
+                              .getSystemService(Context.WIFI_SERVICE);
+                      if (wm == null) return "未知";
+                      WifiInfo info = wm.getConnectionInfo();
+                      if (info == null) return "未知";
+                      int ip = info.getIpAddress();
+                      if (ip == 0) return "未知（请确认已连接 Wi-Fi）";
+                      return String.format("%d.%d.%d.%d",
+                              ip & 0xff, (ip >> 8) & 0xff, (ip >> 16) & 0xff, (ip >> 24) & 0xff);
+                  } catch (Throwable t) {
+                      return "未知";
+                  }
+              }
+          }
+          DCEOF
+
+          cat > app/src/main/java/com/DL/devcontrol/ControlService.java <<'DCEOF'
+          package com.DL.devcontrol;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.IOException;
+          import java.io.InputStreamReader;
+          import java.io.OutputStreamWriter;
+          import java.io.PrintWriter;
+          import java.net.InetSocketAddress;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+          import java.util.Iterator;
+          import java.util.LinkedHashMap;
+          import java.util.Map;
+          import java.util.concurrent.ConcurrentHashMap;
+
+          /**
+           * 局域网设备管控服务：既可以当「主机」接受已授权设备连接、展示它们的设备信息，
+           * 也可以当「用户端」连接到主机、持续上报本机设备信息。只在同一局域网内通信，
+           * 不连接任何外部服务器；授权码只用来防止同一局域网里其他人误连，不是强加密。
+           */
+          public class ControlService extends Service {
+
+              static final int PORT = 47562;
+
+              static final String ACTION_START_HOST = "com.DL.devcontrol.START_HOST";
+              static final String ACTION_STOP_HOST = "com.DL.devcontrol.STOP_HOST";
+              static final String ACTION_START_CLIENT = "com.DL.devcontrol.START_CLIENT";
+              static final String ACTION_STOP_CLIENT = "com.DL.devcontrol.STOP_CLIENT";
+              static final String ACTION_KICK = "com.DL.devcontrol.KICK";
+
+              static final String EXTRA_CODE = "code";
+              static final String EXTRA_IP = "ip";
+              static final String EXTRA_DEVICE_ID = "deviceId";
+
+              private static final String CHANNEL_ID = "devctl";
+              private static final int NOTI_ID = 1;
+
+              interface Listener {
+                  void onChanged();
+              }
+
+              private static volatile ControlService instance;
+              private static volatile Listener listener;
+
+              private final Handler main = new Handler(Looper.getMainLooper());
+              private final Object devicesLock = new Object();
+              private final LinkedHashMap<String, JSONObject> devices = new LinkedHashMap<String, JSONObject>();
+              private final ConcurrentHashMap<String, Socket> sockets = new ConcurrentHashMap<String, Socket>();
+
+              private volatile boolean hostRunning;
+              private volatile String hostCode;
+              private volatile ServerSocket serverSocket;
+              private volatile String hostStatus = "服务未启动";
+
+              private volatile boolean clientRunning;
+              private volatile Socket clientSocket;
+              private volatile String clientStatus = "未连接";
+
+              // ======================= 静态入口：供界面读取状态、下发操作 =======================
+
+              static void setListener(Listener l) {
+                  listener = l;
+              }
+
+              static boolean isHostRunning() {
+                  return instance != null && instance.hostRunning;
+              }
+
+              static boolean isClientRunning() {
+                  return instance != null && instance.clientRunning;
+              }
+
+              static String getHostStatus() {
+                  return instance != null ? instance.hostStatus : "服务未启动";
+              }
+
+              static String getClientStatus() {
+                  return instance != null ? instance.clientStatus : "未连接";
+              }
+
+              static LinkedHashMap<String, JSONObject> snapshot() {
+                  if (instance == null) return new LinkedHashMap<String, JSONObject>();
+                  synchronized (instance.devicesLock) {
+                      return new LinkedHashMap<String, JSONObject>(instance.devices);
+                  }
+              }
+
+              // ======================= 生命周期 =======================
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  instance = this;
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent == null || intent.getAction() == null) return START_NOT_STICKY;
+                  String action = intent.getAction();
+                  if (ACTION_START_HOST.equals(action)) {
+                      startHost(intent.getStringExtra(EXTRA_CODE));
+                  } else if (ACTION_STOP_HOST.equals(action)) {
+                      stopHost();
+                  } else if (ACTION_START_CLIENT.equals(action)) {
+                      startClient(intent.getStringExtra(EXTRA_IP), intent.getStringExtra(EXTRA_CODE));
+                  } else if (ACTION_STOP_CLIENT.equals(action)) {
+                      stopClient();
+                  } else if (ACTION_KICK.equals(action)) {
+                      kickDevice(intent.getStringExtra(EXTRA_DEVICE_ID));
+                  }
+                  maybeStopForeground();
+                  return START_NOT_STICKY;
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              public void onDestroy() {
+                  hostRunning = false;
+                  clientRunning = false;
+                  closeQuietly(serverSocket);
+                  closeQuietly(clientSocket);
+                  for (Socket s : sockets.values()) closeQuietly(s);
+                  sockets.clear();
+                  if (instance == this) instance = null;
+                  super.onDestroy();
+              }
+
+              // ======================= 主机：接受连接，展示设备信息 =======================
+
+              private void startHost(String code) {
+                  if (hostRunning) return;
+                  if (code == null || code.length() < 8) {
+                      hostStatus = "授权码至少需要 8 位";
+                      notifyListener();
+                      return;
+                  }
+                  ServerSocket srv;
+                  try {
+                      srv = new ServerSocket(PORT);
+                  } catch (IOException e) {
+                      hostStatus = "启动失败：端口被占用，或没有网络权限";
+                      notifyListener();
+                      return;
+                  }
+                  serverSocket = srv;
+                  hostCode = code;
+                  hostRunning = true;
+                  hostStatus = "服务已启动 · 端口 " + PORT + " · 本机 IP：" + LanUtil.localIp(this);
+                  ensureForeground();
+                  notifyListener();
+
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          while (hostRunning) {
+                              Socket client;
+                              try {
+                                  client = serverSocket.accept();
+                              } catch (IOException e) {
+                                  break;
+                              }
+                              if (!hostRunning) {
+                                  closeQuietly(client);
+                                  break;
+                              }
+                              handleClient(client);
+                          }
+                      }
+                  }, "devctl-accept").start();
+              }
+
+              private void handleClient(final Socket client) {
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          String deviceId = null;
+                          try {
+                              BufferedReader reader = new BufferedReader(
+                                      new InputStreamReader(client.getInputStream(), "UTF-8"));
+                              PrintWriter writer = new PrintWriter(
+                                      new OutputStreamWriter(client.getOutputStream(), "UTF-8"), true);
+
+                              String first = reader.readLine();
+                              if (first == null) throw new IOException("空连接");
+                              JSONObject hello = new JSONObject(first);
+                              if (!"hello".equals(hello.optString("type"))) throw new IOException("协议错误");
+                              if (hostCode == null || !hostCode.equals(hello.optString("code"))) {
+                                  safePrintln(writer, "{\"type\":\"reject\",\"reason\":\"code\"}");
+                                  throw new IOException("授权码错误");
+                              }
+                              deviceId = hello.optString("deviceId", String.valueOf(client.getInetAddress()));
+
+                              JSONObject snap = new JSONObject(hello.toString());
+                              snap.put("ip", client.getInetAddress().getHostAddress());
+                              snap.put("online", true);
+                              snap.put("lastSeen", System.currentTimeMillis());
+
+                              sockets.put(deviceId, client);
+                              synchronized (devicesLock) {
+                                  devices.put(deviceId, snap);
+                              }
+                              notifyListener();
+                              safePrintln(writer, new JSONObject().put("type", "welcome").toString());
+
+                              while (hostRunning) {
+                                  String line = reader.readLine();
+                                  if (line == null) break;
+                                  JSONObject o;
+                                  try {
+                                      o = new JSONObject(line);
+                                  } catch (Exception badJson) {
+                                      continue;
+                                  }
+                                  String t = o.optString("type");
+                                  if ("beat".equals(t)) {
+                                      applyBeat(deviceId, o);
+                                  } else if ("bye".equals(t)) {
+                                      break;
+                                  }
+                              }
+                          } catch (Throwable ignored) {
+                          } finally {
+                              closeQuietly(client);
+                              final String id = deviceId;
+                              if (id != null) {
+                                  sockets.remove(id);
+                                  synchronized (devicesLock) {
+                                      JSONObject d = devices.get(id);
+                                      if (d != null) {
+                                          try {
+                                              d.put("online", false);
+                                          } catch (Exception ignored2) { }
+                                      }
+                                  }
+                                  notifyListener();
+                              }
+                          }
+                      }
+                  }, "devctl-client").start();
+              }
+
+              private void applyBeat(String deviceId, JSONObject beat) {
+                  synchronized (devicesLock) {
+                      JSONObject d = devices.get(deviceId);
+                      if (d == null) return;
+                      try {
+                          if (beat.has("battery")) d.put("battery", beat.optInt("battery", -1));
+                          d.put("charging", beat.optBoolean("charging", false));
+                          if (beat.has("storageFreeGB")) d.put("storageFreeGB", beat.optDouble("storageFreeGB"));
+                          if (beat.has("ramAvailGB")) d.put("ramAvailGB", beat.optDouble("ramAvailGB"));
+                          d.put("lastSeen", System.currentTimeMillis());
+                      } catch (Exception ignored) { }
+                  }
+                  notifyListener();
+              }
+
+              private void kickDevice(String deviceId) {
+                  if (deviceId == null) return;
+                  Socket s = sockets.get(deviceId);
+                  if (s != null) closeQuietly(s);
+              }
+
+              private void stopHost() {
+                  if (!hostRunning) return;
+                  hostRunning = false;
+                  closeQuietly(serverSocket);
+                  for (Socket s : sockets.values()) closeQuietly(s);
+                  sockets.clear();
+                  synchronized (devicesLock) {
+                      for (JSONObject d : devices.values()) {
+                          try {
+                              d.put("online", false);
+                          } catch (Exception ignored) { }
+                      }
+                  }
+                  hostStatus = "服务未启动";
+                  notifyListener();
+              }
+
+              // ======================= 用户端：连接主机并持续上报本机信息 =======================
+
+              private void startClient(final String ip, final String code) {
+                  if (clientRunning) return;
+                  if (ip == null || ip.length() == 0) {
+                      clientStatus = "请输入主机 IP";
+                      notifyListener();
+                      return;
+                  }
+                  if (code == null || code.length() < 8) {
+                      clientStatus = "请输入授权码（至少 8 位）";
+                      notifyListener();
+                      return;
+                  }
+                  clientRunning = true;
+                  clientStatus = "正在连接 " + ip + " …";
+                  ensureForeground();
+                  notifyListener();
+
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          Socket sock = null;
+                          try {
+                              sock = new Socket();
+                              sock.connect(new InetSocketAddress(ip, PORT), 8000);
+                              clientSocket = sock;
+                              PrintWriter writer = new PrintWriter(
+                                      new OutputStreamWriter(sock.getOutputStream(), "UTF-8"), true);
+                              BufferedReader reader = new BufferedReader(
+                                      new InputStreamReader(sock.getInputStream(), "UTF-8"));
+
+                              JSONObject hello = DeviceInfo.collect(ControlService.this);
+                              hello.put("type", "hello");
+                              hello.put("code", code);
+                              hello.put("deviceId", DeviceInfo.deviceId(ControlService.this));
+                              writer.println(hello.toString());
+
+                              String resp = reader.readLine();
+                              if (resp == null) throw new IOException("连接被拒绝或已断开");
+                              JSONObject robj = new JSONObject(resp);
+                              if (!"welcome".equals(robj.optString("type"))) {
+                                  throw new IOException("授权码错误，或被管控端拒绝");
+                              }
+
+                              clientStatus = "已连接到 " + ip;
+                              notifyListener();
+
+                              while (clientRunning) {
+                                  JSONObject beat = DeviceInfo.collect(ControlService.this);
+                                  beat.put("type", "beat");
+                                  beat.put("deviceId", DeviceInfo.deviceId(ControlService.this));
+                                  safePrintln(writer, beat.toString());
+                                  for (int i = 0; i < 10 && clientRunning; i++) {
+                                      try {
+                                          Thread.sleep(500);
+                                      } catch (InterruptedException ie) {
+                                          break;
+                                      }
+                                  }
+                              }
+                              safePrintln(writer, "{\"type\":\"bye\"}");
+                          } catch (Throwable t) {
+                              String msg = t.getMessage();
+                              clientStatus = "连接失败：" + (msg != null ? msg : t.toString());
+                          } finally {
+                              closeQuietly(sock);
+                              clientRunning = false;
+                              clientSocket = null;
+                              notifyListener();
+                              maybeStopForeground();
+                          }
+                      }
+                  }, "devctl-join").start();
+              }
+
+              private void stopClient() {
+                  if (!clientRunning && clientSocket == null) return;
+                  clientRunning = false;
+                  closeQuietly(clientSocket);
+                  clientStatus = "未连接";
+                  notifyListener();
+              }
+
+              // ======================= 辅助 =======================
+
+              private void notifyListener() {
+                  main.post(new Runnable() {
+                      @Override
+                      public void run() {
+                          Listener l = listener;
+                          if (l != null) l.onChanged();
+                      }
+                  });
+              }
+
+              private void ensureForeground() {
+                  startForeground(NOTI_ID, buildNotification());
+              }
+
+              private void maybeStopForeground() {
+                  if (!hostRunning && !clientRunning) {
+                      stopForeground(true);
+                      stopSelf();
+                  } else {
+                      // 状态有变化（比如主机已启动、人数变化），刷新一下通知文案
+                      NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                      if (nm != null) nm.notify(NOTI_ID, buildNotification());
+                  }
+              }
+
+              private Notification buildNotification() {
+                  StringBuilder text = new StringBuilder();
+                  if (hostRunning) text.append("主机运行中");
+                  if (clientRunning) {
+                      if (text.length() > 0) text.append(" · ");
+                      text.append("已连接到主机");
+                  }
+                  if (text.length() == 0) text.append("未运行");
+
+                  Notification.Builder b;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                      if (nm != null && nm.getNotificationChannel(CHANNEL_ID) == null) {
+                          nm.createNotificationChannel(new NotificationChannel(
+                                  CHANNEL_ID, "设备管控", NotificationManager.IMPORTANCE_LOW));
+                      }
+                      b = new Notification.Builder(this, CHANNEL_ID);
+                  } else {
+                      b = new Notification.Builder(this);
+                  }
+                  b.setContentTitle("设备管控");
+                  b.setContentText(text.toString());
+                  b.setSmallIcon(android.R.drawable.stat_notify_sync);
+                  b.setOngoing(true);
+                  Intent open = new Intent(this, MainActivity.class);
+                  int flags = Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
+                  b.setContentIntent(PendingIntent.getActivity(this, 0, open, flags));
+                  return b.build();
+              }
+
+              private static void safePrintln(PrintWriter w, String s) {
+                  try {
+                      w.println(s);
+                  } catch (Throwable ignored) { }
+              }
+
+              private static void closeQuietly(ServerSocket s) {
+                  if (s == null) return;
+                  try {
+                      s.close();
+                  } catch (Throwable ignored) { }
+              }
+
+              private static void closeQuietly(Socket s) {
+                  if (s == null) return;
+                  try {
+                      s.close();
+                  } catch (Throwable ignored) { }
+              }
+          }
+          DCEOF
+
+          cat > app/src/main/java/com/DL/devcontrol/MainActivity.java <<'DCEOF'
+          package com.DL.devcontrol;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import org.json.JSONObject;
+
+          import java.util.LinkedHashMap;
+          import java.util.Map;
+
+          /** 设备管控：既可以作为主机查看局域网内已授权设备的信息，也可以作为用户端连接到主机上报本机信息。 */
+          public class MainActivity extends Activity implements ControlService.Listener {
+
+              private EditText adminCodeEt, hostIpEt, joinCodeEt;
+              private TextView hostStatusTv, joinStatusTv, summaryTv;
+              private LinearLayout deviceListBox;
+              private SharedPreferences sp;
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  sp = getSharedPreferences("devctl", Context.MODE_PRIVATE);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(24), dp(48), dp(24), dp(32));
+
+                  TextView title = new TextView(this);
+                  title.setText("设备管控");
+                  title.setTextSize(28);
+                  root.addView(title);
+
+                  TextView subtitle = new TextView(this);
+                  subtitle.setText("局域网内查看 / 上报设备信息，不连接任何外部服务器");
+                  subtitle.setTextSize(13);
+                  subtitle.setTextColor(Color.parseColor("#8E8E93"));
+                  subtitle.setPadding(0, dp(4), 0, dp(24));
+                  root.addView(subtitle);
+
+                  // ---------------- 主机 ----------------
+                  addSectionTitle(root, "管控端（查看其他设备）");
+
+                  adminCodeEt = new EditText(this);
+                  adminCodeEt.setHint("授权码（至少 8 位，自己设置）");
+                  root.addView(adminCodeEt, matchWrap());
+
+                  LinearLayout hostBtnRow = new LinearLayout(this);
+                  hostBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+                  hostBtnRow.setPadding(0, dp(8), 0, 0);
+                  Button startHost = new Button(this);
+                  startHost.setText("启动管控服务");
+                  Button stopHost = new Button(this);
+                  stopHost.setText("停止服务");
+                  hostBtnRow.addView(startHost, weightLp());
+                  hostBtnRow.addView(stopHost, weightLp());
+                  root.addView(hostBtnRow, matchWrap());
+
+                  hostStatusTv = new TextView(this);
+                  hostStatusTv.setTextSize(13);
+                  hostStatusTv.setPadding(0, dp(8), 0, dp(4));
+                  hostStatusTv.setTextIsSelectable(true);
+                  root.addView(hostStatusTv, matchWrap());
+
+                  summaryTv = new TextView(this);
+                  summaryTv.setTextSize(13);
+                  summaryTv.setTextColor(Color.parseColor("#5A6270"));
+                  root.addView(summaryTv, matchWrap());
+
+                  deviceListBox = new LinearLayout(this);
+                  deviceListBox.setOrientation(LinearLayout.VERTICAL);
+                  deviceListBox.setPadding(0, dp(8), 0, dp(8));
+                  root.addView(deviceListBox, matchWrap());
+
+                  divider(root);
+
+                  // ---------------- 用户端 ----------------
+                  addSectionTitle(root, "用户端（把本机信息上报给管控端）");
+
+                  hostIpEt = new EditText(this);
+                  hostIpEt.setHint("管控端的局域网 IP，例如 192.168.1.5");
+                  root.addView(hostIpEt, matchWrap());
+
+                  joinCodeEt = new EditText(this);
+                  joinCodeEt.setHint("授权码（与管控端一致）");
+                  root.addView(joinCodeEt, matchWrap());
+
+                  LinearLayout joinBtnRow = new LinearLayout(this);
+                  joinBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+                  joinBtnRow.setPadding(0, dp(8), 0, 0);
+                  Button join = new Button(this);
+                  join.setText("授权并连接");
+                  Button leave = new Button(this);
+                  leave.setText("断开连接");
+                  joinBtnRow.addView(join, weightLp());
+                  joinBtnRow.addView(leave, weightLp());
+                  root.addView(joinBtnRow, matchWrap());
+
+                  joinStatusTv = new TextView(this);
+                  joinStatusTv.setTextSize(13);
+                  joinStatusTv.setPadding(0, dp(8), 0, 0);
+                  joinStatusTv.setTextIsSelectable(true);
+                  root.addView(joinStatusTv, matchWrap());
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.addView(root);
+                  setContentView(sv);
+
+                  adminCodeEt.setText(sp.getString("admin_code", ""));
+                  hostIpEt.setText(sp.getString("host_ip", ""));
+                  joinCodeEt.setText(sp.getString("admin_code", ""));
+
+                  startHost.setOnClickListener(new View.OnClickListener() {
+                      @Override public void onClick(View v) {
+                          String code = adminCodeEt.getText().toString().trim();
+                          if (code.length() < 8) {
+                              Toast.makeText(MainActivity.this, "授权码至少需要 8 位", Toast.LENGTH_SHORT).show();
+                              return;
+                          }
+                          sp.edit().putString("admin_code", code).apply();
+                          Intent i = new Intent(MainActivity.this, ControlService.class)
+                                  .setAction(ControlService.ACTION_START_HOST)
+                                  .putExtra(ControlService.EXTRA_CODE, code);
+                          startServiceCompat(i);
+                      }
+                  });
+                  stopHost.setOnClickListener(new View.OnClickListener() {
+                      @Override public void onClick(View v) {
+                          startServiceCompat(new Intent(MainActivity.this, ControlService.class)
+                                  .setAction(ControlService.ACTION_STOP_HOST));
+                      }
+                  });
+                  join.setOnClickListener(new View.OnClickListener() {
+                      @Override public void onClick(View v) {
+                          String ip = hostIpEt.getText().toString().trim();
+                          String code = joinCodeEt.getText().toString().trim();
+                          if (ip.length() == 0) {
+                              Toast.makeText(MainActivity.this, "请输入管控端的局域网 IP", Toast.LENGTH_SHORT).show();
+                              return;
+                          }
+                          if (code.length() < 8) {
+                              Toast.makeText(MainActivity.this, "请输入授权码（至少 8 位）", Toast.LENGTH_SHORT).show();
+                              return;
+                          }
+                          sp.edit().putString("host_ip", ip).putString("admin_code", code).apply();
+                          Intent i = new Intent(MainActivity.this, ControlService.class)
+                                  .setAction(ControlService.ACTION_START_CLIENT)
+                                  .putExtra(ControlService.EXTRA_IP, ip)
+                                  .putExtra(ControlService.EXTRA_CODE, code);
+                          startServiceCompat(i);
+                      }
+                  });
+                  leave.setOnClickListener(new View.OnClickListener() {
+                      @Override public void onClick(View v) {
+                          startServiceCompat(new Intent(MainActivity.this, ControlService.class)
+                                  .setAction(ControlService.ACTION_STOP_CLIENT));
+                      }
+                  });
+              }
+
+              private void startServiceCompat(Intent i) {
+                  try {
+                      if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+                      else startService(i);
+                  } catch (Throwable t) {
+                      Toast.makeText(this, "操作失败：" + t, Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  ControlService.setListener(this);
+                  refresh();
+              }
+
+              @Override
+              protected void onPause() {
+                  ControlService.setListener(null);
+                  super.onPause();
+              }
+
+              @Override
+              public void onChanged() {
+                  refresh();
+              }
+
+              private void refresh() {
+                  hostStatusTv.setText(ControlService.getHostStatus());
+                  joinStatusTv.setText(ControlService.getClientStatus());
+
+                  LinkedHashMap<String, JSONObject> devices = ControlService.snapshot();
+                  deviceListBox.removeAllViews();
+                  int online = 0;
+                  if (devices.isEmpty()) {
+                      TextView tip = new TextView(this);
+                      tip.setText("启动管控服务后，已授权设备连接上来会显示在这里：型号、系统版本、处理器、电量等。");
+                      tip.setTextSize(13);
+                      tip.setTextColor(Color.parseColor("#8E8E93"));
+                      deviceListBox.addView(tip, matchWrap());
+                  }
+                  for (Map.Entry<String, JSONObject> e : devices.entrySet()) {
+                      final String id = e.getKey();
+                      JSONObject d = e.getValue();
+                      boolean isOnline = d.optBoolean("online", false);
+                      if (isOnline) online++;
+                      deviceListBox.addView(buildDeviceRow(id, d, isOnline), matchWrap());
+                  }
+                  summaryTv.setText("在线 " + online + " 台 · 已登记 " + devices.size() + " 台");
+              }
+
+              private View buildDeviceRow(final String deviceId, JSONObject d, boolean online) {
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.VERTICAL);
+                  row.setPadding(dp(14), dp(10), dp(14), dp(10));
+                  row.setBackgroundColor(Color.parseColor(online ? "#F2F7F2" : "#F5F5F6"));
+                  LinearLayout.LayoutParams rowLp = matchWrap();
+                  rowLp.topMargin = dp(8);
+                  row.setLayoutParams(rowLp);
+
+                  String model = d.optString("model", "未知型号");
+                  String manu = d.optString("manufacturer", "");
+                  TextView t1 = new TextView(this);
+                  t1.setText(model + (manu.length() > 0 ? "（" + manu + "）" : ""));
+                  t1.setTextSize(15);
+                  t1.setTextColor(Color.parseColor("#1C1C1E"));
+                  row.addView(t1, matchWrap());
+
+                  row.addView(line("系统：Android " + d.optString("release", "?")
+                          + "（API " + d.optInt("sdk", 0) + "）"), matchWrap());
+
+                  String cpu = d.optString("cpuHardware", "");
+                  if (cpu.length() == 0) cpu = d.optString("abi", "未知");
+                  row.addView(line("处理器：" + cpu + " · " + d.optInt("cores", 0) + " 核"), matchWrap());
+
+                  String bat = d.has("battery") ? (d.optInt("battery", -1) + "%") : "未知";
+                  row.addView(line("电量：" + bat + (d.optBoolean("charging", false) ? "（充电中）" : "")), matchWrap());
+
+                  StringBuilder extra = new StringBuilder();
+                  if (d.has("storageFreeGB")) extra.append("剩余空间 ")
+                          .append(String.format("%.1f", d.optDouble("storageFreeGB"))).append("GB");
+                  if (d.has("ramAvailGB")) {
+                      if (extra.length() > 0) extra.append(" · ");
+                      extra.append("可用内存 ").append(String.format("%.1f", d.optDouble("ramAvailGB"))).append("GB");
+                  }
+                  if (extra.length() > 0) row.addView(line(extra.toString()), matchWrap());
+
+                  row.addView(line("IP：" + d.optString("ip", "?") + " · 应用版本 " + d.optString("appVer", "?")
+                          + " · " + (online ? "在线" : "离线")), matchWrap());
+
+                  if (online) {
+                      Button kick = new Button(this);
+                      kick.setText("断开");
+                      kick.setTextSize(13);
+                      LinearLayout.LayoutParams blp = matchWrap();
+                      blp.topMargin = dp(6);
+                      kick.setLayoutParams(blp);
+                      kick.setOnClickListener(new View.OnClickListener() {
+                          @Override public void onClick(View v) {
+                              startServiceCompat(new Intent(MainActivity.this, ControlService.class)
+                                      .setAction(ControlService.ACTION_KICK)
+                                      .putExtra(ControlService.EXTRA_DEVICE_ID, deviceId));
+                          }
+                      });
+                      row.addView(kick);
+                  }
+                  return row;
+              }
+
+              private TextView line(String text) {
+                  TextView tv = new TextView(this);
+                  tv.setText(text);
+                  tv.setTextSize(12);
+                  tv.setTextColor(Color.parseColor("#5A6270"));
+                  tv.setPadding(0, dp(2), 0, 0);
+                  return tv;
+              }
+
+              private void addSectionTitle(LinearLayout root, String text) {
+                  TextView tv = new TextView(this);
+                  tv.setText(text);
+                  tv.setTextSize(16);
+                  tv.setPadding(0, dp(4), 0, dp(10));
+                  root.addView(tv, matchWrap());
+              }
+
+              private void divider(LinearLayout root) {
+                  View v = new View(this);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(1));
+                  lp.topMargin = dp(20);
+                  lp.bottomMargin = dp(16);
+                  v.setBackgroundColor(Color.parseColor("#E0E0E0"));
+                  root.addView(v, lp);
+              }
+
+              private LinearLayout.LayoutParams matchWrap() {
+                  return new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+              }
+
+              private LinearLayout.LayoutParams weightLp() {
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+                  lp.rightMargin = dp(4);
+                  return lp;
+              }
+          }
+          DCEOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'
+
+      - name: Build debug APK
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --console=plain 2>&1 | tee build.log
+
+      - name: Show errors
+        if: failure()
+        run: |
+          grep -n -E "error:|What went wrong|FAILED|Could not|Execution failed" -A4 build.log | head -150
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeviceControl-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
