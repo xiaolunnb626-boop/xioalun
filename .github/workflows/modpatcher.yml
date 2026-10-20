@@ -1,0 +1,561 @@
+name: build-modpatcher
+# 在 GitHub 网页上：Actions → build-modpatcher → Run workflow
+# 若仓库里已有 loader/com/example/mod/Loader.java 或 native/mymod.c，会优先使用你自己的版本。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build.yml"
+      - "loader/**"
+      - "native/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Generate project files
+        run: |
+          set -e
+          cat > settings.gradle.kts <<'__END__'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ModPatcher"
+          include(":app")
+          __END__
+          cat > build.gradle.kts <<'__END__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __END__
+          cat > gradle.properties <<'__END__'
+          org.gradle.jvmargs=-Xmx3g
+          android.nonTransitiveRClass=true
+          __END__
+          mkdir -p app
+          cat > app/build.gradle.kts <<'__END__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.modpatcher"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.modpatcher"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              packaging {
+                  resources {
+                      excludes += setOf(
+                          "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*",
+                          "META-INF/*.kotlin_module", "META-INF/versions/**", "META-INF/MANIFEST.MF"
+                      )
+                  }
+              }
+          }
+
+          dependencies {
+              implementation("com.android.tools.smali:smali-dexlib2:3.0.9")
+              implementation("com.android.tools.build:apksig:8.5.2")
+              implementation("org.apache.commons:commons-compress:1.26.2")
+          }
+
+          configurations.all {
+              exclude(group = "com.google.guava", module = "listenablefuture")
+          }
+          __END__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__END__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+              <application
+                  android:label="ModPatcher"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <receiver android:name=".InstallReceiver" android:exported="false" />
+              </application>
+          </manifest>
+          __END__
+          mkdir -p app/src/main/java/com/example/modpatcher
+          cat > app/src/main/java/com/example/modpatcher/InstallReceiver.kt <<'__END__'
+          package com.example.modpatcher
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageInstaller
+          import android.widget.Toast
+
+          class InstallReceiver : BroadcastReceiver() {
+              @Suppress("DEPRECATION")
+              override fun onReceive(c: Context, i: Intent) {
+                  when (i.getIntExtra(PackageInstaller.EXTRA_STATUS, -1)) {
+                      PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                          val confirm = i.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                          if (confirm != null) {
+                              confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                              c.startActivity(confirm)
+                          }
+                      }
+                      PackageInstaller.STATUS_SUCCESS ->
+                          Toast.makeText(c, "安装成功", Toast.LENGTH_LONG).show()
+                      else -> {
+                          val msg = i.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
+                          Toast.makeText(c, "安装失败: $msg", Toast.LENGTH_LONG).show()
+                      }
+                  }
+              }
+          }
+          __END__
+          mkdir -p app/src/main/java/com/example/modpatcher
+          cat > app/src/main/java/com/example/modpatcher/MainActivity.kt <<'__END__'
+          package com.example.modpatcher
+
+          import android.app.Activity
+          import android.app.PendingIntent
+          import android.content.Intent
+          import android.content.pm.PackageInstaller
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.io.File
+          import java.io.FileInputStream
+
+          class MainActivity : Activity() {
+              private lateinit var logView: TextView
+              private lateinit var installBtn: Button
+              private var picked: Uri? = null
+              private var result: File? = null
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  val pickBtn = Button(this).apply { text = "1. 选择游戏 APK" }
+                  val runBtn = Button(this).apply { text = "2. 开始注入" }
+                  installBtn = Button(this).apply { text = "3. 安装"; isEnabled = false }
+                  logView = TextView(this).apply { textSize = 13f; setTextIsSelectable(true) }
+                  root.addView(pickBtn)
+                  root.addView(runBtn)
+                  root.addView(installBtn)
+                  root.addView(ScrollView(this).apply { addView(logView) })
+                  setContentView(root)
+
+                  pickBtn.setOnClickListener {
+                      val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                          addCategory(Intent.CATEGORY_OPENABLE)
+                          type = "*/*"
+                      }
+                      startActivityForResult(i, 1)
+                  }
+                  runBtn.setOnClickListener {
+                      val uri = picked
+                      if (uri == null) { log("请先选择 APK"); return@setOnClickListener }
+                      installBtn.isEnabled = false
+                      Thread {
+                          try {
+                              log("开始处理…（大包可能需要几分钟）")
+                              val f = Patcher.run(this, uri) { log(it) }
+                              result = f
+                              log("完成: ${f.length() / 1048576} MB")
+                              runOnUiThread { installBtn.isEnabled = true }
+                          } catch (t: Throwable) {
+                              log("失败: $t")
+                              t.stackTrace.take(8).forEach { log("  at $it") }
+                          }
+                      }.start()
+                  }
+                  installBtn.setOnClickListener { install() }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 1 && resultCode == RESULT_OK) {
+                      picked = data?.data
+                      log("已选择: $picked")
+                  }
+              }
+
+              private fun log(s: String) = runOnUiThread { logView.append(s + "\n") }
+
+              private fun install() {
+                  val apk = result ?: return
+                  if (!packageManager.canRequestPackageInstalls()) {
+                      startActivity(
+                          Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))
+                      )
+                      log("请先允许本应用安装未知应用，然后再点安装")
+                      return
+                  }
+                  try {
+                      val pi = packageManager.packageInstaller
+                      val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+                      val id = pi.createSession(params)
+                      pi.openSession(id).use { s ->
+                          FileInputStream(apk).use { ins ->
+                              s.openWrite("base.apk", 0, apk.length()).use { os ->
+                                  ins.copyTo(os)
+                                  s.fsync(os)
+                              }
+                          }
+                          val intent = Intent(this, InstallReceiver::class.java)
+                          val pending = PendingIntent.getBroadcast(
+                              this, id, intent, PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                          )
+                          s.commit(pending.intentSender)
+                      }
+                      log("已提交安装，按系统提示操作。若提示签名冲突，请先卸载官方版（会丢本地存档）")
+                  } catch (t: Throwable) {
+                      log("安装失败: $t")
+                  }
+              }
+          }
+          __END__
+          mkdir -p app/src/main/java/com/example/modpatcher
+          cat > app/src/main/java/com/example/modpatcher/Patcher.kt <<'__END__'
+          package com.example.modpatcher
+
+          import android.content.Context
+          import android.net.Uri
+          import com.android.apksig.ApkSigner
+          import com.android.tools.smali.dexlib2.Opcode
+          import com.android.tools.smali.dexlib2.Opcodes
+          import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
+          import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction35c
+          import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction3rc
+          import com.android.tools.smali.dexlib2.dexbacked.DexBackedDexFile
+          import com.android.tools.smali.dexlib2.iface.ClassDef
+          import com.android.tools.smali.dexlib2.iface.DexFile
+          import com.android.tools.smali.dexlib2.iface.Method
+          import com.android.tools.smali.dexlib2.immutable.ImmutableClassDef
+          import com.android.tools.smali.dexlib2.immutable.ImmutableMethod
+          import com.android.tools.smali.dexlib2.immutable.reference.ImmutableMethodReference
+          import com.android.tools.smali.dexlib2.writer.io.MemoryDataStore
+          import com.android.tools.smali.dexlib2.writer.pool.DexPool
+          import org.apache.commons.compress.archivers.zip.ZipArchiveEntry
+          import org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream
+          import org.apache.commons.compress.archivers.zip.ZipFile
+          import java.io.File
+          import java.io.FileInputStream
+          import java.security.KeyStore
+          import java.security.PrivateKey
+          import java.security.cert.X509Certificate
+          import java.util.Collections
+          import java.util.zip.ZipEntry
+
+          /**
+           * 把 Loader 注入到 UnityPlayerActivity.onCreate，并加入 loader dex 与 so，然后重新签名。
+           * 未改动的条目按原始压缩数据直接复制，不重新压缩，所以大包也不会太慢。
+           */
+          object Patcher {
+              private const val TARGET = "Lcom/unity3d/player/UnityPlayerActivity;"
+              private const val LOADER = "Lcom/example/mod/Loader;"
+              private const val SO_PATH = "assets/mymod/arm64-v8a/libmymod.so"
+              private val OPCODES: Opcodes = Opcodes.forApi(26)
+              private val DEX_RE = Regex("classes(\\d*)\\.dex")
+              private val SIG_RE = Regex("META-INF/(MANIFEST\\.MF|[^/]+\\.(SF|RSA|DSA|EC))")
+
+              fun run(ctx: Context, input: Uri, log: (String) -> Unit): File {
+                  val unsigned = File(ctx.cacheDir, "unsigned.apk").also { it.delete() }
+                  val signed = File(ctx.filesDir, "patched.apk").also { it.delete() }
+                  val pfd = ctx.contentResolver.openFileDescriptor(input, "r") ?: error("无法打开所选文件")
+                  pfd.use {
+                      val channel = FileInputStream(it.fileDescriptor).channel
+                      ZipFile(channel).use { zip -> patchZip(ctx, zip, unsigned, log) }
+                  }
+                  log("签名中…")
+                  sign(ctx, unsigned, signed)
+                  unsigned.delete()
+                  return signed
+              }
+
+              private fun dexIndex(name: String): Int =
+                  DEX_RE.matchEntire(name)!!.groupValues[1].let { if (it.isEmpty()) 1 else it.toInt() }
+
+              private fun patchZip(ctx: Context, zip: ZipFile, outFile: File, log: (String) -> Unit) {
+                  val entries = Collections.list(zip.entries)
+                  val dexNames = entries.map { it.name }.filter { DEX_RE.matches(it) }.sortedBy { dexIndex(it) }
+                  if (dexNames.isEmpty()) error("APK 里没有 dex")
+
+                  var targetName: String? = null
+                  var patched: ByteArray? = null
+                  for (n in dexNames) {
+                      val bytes = zip.getInputStream(zip.getEntry(n)).use { it.readBytes() }
+                      val dex = DexBackedDexFile(OPCODES, bytes)
+                      if (dex.classes.any { it.type == TARGET }) {
+                          log("在 $n 找到 UnityPlayerActivity，开始修改")
+                          patched = patchDex(dex)
+                          targetName = n
+                          break
+                      }
+                  }
+                  if (targetName == null || patched == null) error("没有找到 $TARGET")
+                  val newDex = "classes${dexIndex(dexNames.last()) + 1}.dex"
+                  log("新增 $newDex 和 $SO_PATH")
+
+                  ZipArchiveOutputStream(outFile).use { out ->
+                      for (e in entries) {
+                          if (SIG_RE.matches(e.name)) continue
+                          if (e.name == targetName) { putBytes(out, e.name, patched); continue }
+                          if (e.method == ZipEntry.STORED) {
+                              e.alignment = if (e.name.endsWith(".so")) 16384 else 4
+                          }
+                          zip.getRawInputStream(e).use { raw -> out.addRawArchiveEntry(e, raw) }
+                      }
+                      putBytes(out, newDex, ctx.assets.open("loader.dex").use { it.readBytes() })
+                      putBytes(out, SO_PATH, ctx.assets.open("libmymod.so").use { it.readBytes() })
+                  }
+              }
+
+              private fun putBytes(out: ZipArchiveOutputStream, name: String, data: ByteArray) {
+                  val e = ZipArchiveEntry(name)
+                  e.method = ZipEntry.DEFLATED
+                  out.putArchiveEntry(e)
+                  out.write(data)
+                  out.closeArchiveEntry()
+              }
+
+              private fun patchDex(dex: DexBackedDexFile): ByteArray {
+                  val classes = LinkedHashSet<ClassDef>()
+                  for (c in dex.classes) classes.add(if (c.type == TARGET) patchClass(c) else c)
+                  val file = object : DexFile {
+                      override fun getClasses(): Set<ClassDef> = classes
+                      override fun getOpcodes(): Opcodes = OPCODES
+                  }
+                  val store = MemoryDataStore()
+                  DexPool.writeTo(store, file)
+                  return store.data
+              }
+
+              private fun patchClass(cls: ClassDef): ClassDef {
+                  val methods = ArrayList<Method>()
+                  var done = false
+                  for (m in cls.methods) {
+                      val isOnCreate = m.name == "onCreate" && m.returnType == "V" &&
+                          m.parameterTypes.size == 1 && m.parameterTypes[0].toString() == "Landroid/os/Bundle;"
+                      if (!done && isOnCreate && m.implementation != null) {
+                          methods.add(patchMethod(m))
+                          done = true
+                      } else {
+                          methods.add(m)
+                      }
+                  }
+                  if (!done) error("UnityPlayerActivity 里没有可修改的 onCreate(Bundle)")
+                  return ImmutableClassDef(
+                      cls.type, cls.accessFlags, cls.superclass, cls.interfaces,
+                      cls.sourceFile, cls.annotations, cls.fields, methods
+                  )
+              }
+
+              private fun patchMethod(m: Method): Method {
+                  val impl = MutableMethodImplementation(m.implementation!!)
+                  val thisReg = impl.registerCount - 2 // this + Bundle 两个参数寄存器
+                  val ref = ImmutableMethodReference(LOADER, "load", listOf("Landroid/content/Context;"), "V")
+                  val insn = if (thisReg <= 15) {
+                      BuilderInstruction35c(Opcode.INVOKE_STATIC, 1, thisReg, 0, 0, 0, 0, ref)
+                  } else {
+                      BuilderInstruction3rc(Opcode.INVOKE_STATIC_RANGE, thisReg, 1, ref)
+                  }
+                  impl.addInstruction(0, insn)
+                  return ImmutableMethod(
+                      m.definingClass, m.name, m.parameters, m.returnType, m.accessFlags,
+                      m.annotations, m.hiddenApiRestrictions, impl
+                  )
+              }
+
+              private fun sign(ctx: Context, input: File, output: File) {
+                  val pw = "modpatcher".toCharArray()
+                  val ks = KeyStore.getInstance("PKCS12")
+                  ctx.assets.open("sign.p12").use { ks.load(it, pw) }
+                  val key = ks.getKey("mod", pw) as PrivateKey
+                  val cert = ks.getCertificate("mod") as X509Certificate
+                  val cfg = ApkSigner.SignerConfig.Builder("mod", key, listOf(cert)).build()
+                  ApkSigner.Builder(listOf(cfg))
+                      .setInputApk(input)
+                      .setOutputApk(output)
+                      .setMinSdkVersion(26)
+                      .setV1SigningEnabled(true)
+                      .setV2SigningEnabled(true)
+                      .setV3SigningEnabled(true)
+                      .build()
+                      .sign()
+              }
+          }
+          __END__
+          mkdir -p loader/com/example/mod
+          if [ ! -f loader/com/example/mod/Loader.java ]; then
+          cat > loader/com/example/mod/Loader.java <<'__END__'
+          package com.example.mod;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.Log;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.FrameLayout;
+          import android.widget.Toast;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+
+          public class Loader {
+              private static final String TAG = "MYMOD";
+
+              public static void load(final Context ctx) {
+                  try {
+                      File dir = new File(ctx.getCodeCacheDir(), "mymod");
+                      dir.mkdirs();
+                      File out = new File(dir, "libmymod.so");
+                      if (out.exists()) out.delete();
+                      InputStream in = ctx.getAssets().open("mymod/arm64-v8a/libmymod.so");
+                      OutputStream os = new FileOutputStream(out);
+                      byte[] buf = new byte[8192];
+                      int n;
+                      while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                      os.close();
+                      in.close();
+                      out.setReadOnly();
+                      System.load(out.getAbsolutePath());
+                      Log.i(TAG, "so loaded: " + out);
+                  } catch (Throwable t) {
+                      Log.e(TAG, "load failed", t);
+                  }
+                  if (ctx instanceof Activity) {
+                      final Activity act = (Activity) ctx;
+                      new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                          @Override public void run() { showButton(act); }
+                      }, 3000);
+                  }
+              }
+
+              private static void showButton(final Activity act) {
+                  try {
+                      Button b = new Button(act);
+                      b.setText("MOD");
+                      b.setOnClickListener(new View.OnClickListener() {
+                          @Override public void onClick(View v) {
+                              Toast.makeText(act, "mod menu clicked", Toast.LENGTH_SHORT).show();
+                          }
+                      });
+                      FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                              FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+                      lp.gravity = Gravity.TOP | Gravity.END;
+                      act.addContentView(b, lp);
+                  } catch (Throwable t) {
+                      Log.e(TAG, "showButton failed", t);
+                  }
+              }
+          }
+          __END__
+          fi
+          mkdir -p native
+          if [ ! -f native/mymod.c ]; then
+          cat > native/mymod.c <<'__END__'
+          #include <jni.h>
+          #include <android/log.h>
+
+          JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+              __android_log_print(ANDROID_LOG_INFO, "MYMOD", "native loaded");
+              return JNI_VERSION_1_6;
+          }
+          __END__
+          fi
+          mkdir -p app/src/main/assets
+
+      - name: Prepare Android SDK
+        run: |
+          set -e
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            yes | "$SDKM" --licenses > /dev/null || true
+            "$SDKM" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+          fi
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
+
+      - name: Build loader.dex
+        run: |
+          set -e
+          ANDROID_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
+          D8="$ANDROID_HOME/build-tools/34.0.0/d8"
+          mkdir -p build/loader build/loader-out
+          javac -source 8 -target 8 -Xlint:-options -bootclasspath "$ANDROID_JAR" \
+            -d build/loader loader/com/example/mod/Loader.java
+          "$D8" --lib "$ANDROID_JAR" --output build/loader-out $(find build/loader -name '*.class')
+          cp build/loader-out/classes.dex app/src/main/assets/loader.dex
+
+      - name: Build libmymod.so
+        run: |
+          set -e
+          NDK="${ANDROID_NDK_HOME:-$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -1)}"
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          "$CC" -shared -fPIC -O2 -o app/src/main/assets/libmymod.so native/mymod.c -llog
+
+      - name: Restore signing key
+        uses: actions/cache@v4
+        with:
+          path: sign.p12
+          key: modpatcher-keystore-v1
+
+      - name: Create signing key if missing
+        run: |
+          set -e
+          if [ ! -f sign.p12 ]; then
+            keytool -J-Dkeystore.pkcs12.legacy -genkeypair -alias mod -keyalg RSA -keysize 2048 \
+              -validity 36500 -storetype PKCS12 -keystore sign.p12 \
+              -storepass modpatcher -keypass modpatcher -dname "CN=ModPatcher"
+          fi
+          cp sign.p12 app/src/main/assets/sign.p12
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ModPatcher
+          path: app/build/outputs/apk/debug/app-debug.apk
